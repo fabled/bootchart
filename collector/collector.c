@@ -34,10 +34,12 @@
 
 #include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sys/timerfd.h>
 #include <linux/fs.h>
 #include <linux/genetlink.h>
 #include <linux/taskstats.h>
 #include <linux/cgroupstats.h>
+#include <poll.h>
 #include <signal.h>
 
 /* pid uniqifying code */
@@ -823,14 +825,15 @@ int main (int argc, char *argv[])
 	Arguments args;
 	int i, use_taskstat;
 	int in_initrd = 0, clean_environment = 1;
-	int stat_fd, disk_fd, uptime_fd, meminfo_fd,  pid, ret = 1;
+	int stat_fd, disk_fd, uptime_fd, meminfo_fd, collector_fd, ret = 1;
 	PidScanner *scanner = NULL;
 	unsigned long reltime = 0;
 	BufferFile *stat_file, *disk_file, *per_pid_file, *meminfo_file;
 	PidEventClosure pid_ev_cl;
 	int *fds[] = { &stat_fd, &disk_fd, &uptime_fd, &meminfo_fd, NULL };
 	const char *fd_names[] = { "/stat", "/diskstats", "/uptime", "/meminfo", NULL };
-	StackMap map = STACK_MAP_INIT; /* make me findable */
+	BufferMap map = {0};
+	struct pollfd pollfds[2];
 
 	arguments_set_defaults (&args);
 	arguments_parse (&args, argc, argv);
@@ -853,12 +856,11 @@ int main (int argc, char *argv[])
 		log (" '%s'\n", argv[i]);
 
 	if (args.dump_path) {
-		Arguments remote_args;
+		DaemonFlags df;
 
-		ret = buffers_extract_and_dump (args.dump_path, &remote_args);
+		ret = collector_dump (args.dump_path, &df);
 		ret |= dump_header (args.dump_path);
-
-		if (!remote_args.relative_time)
+		if (!df.relative_time)
 			ret |= dump_dmsg (args.dump_path);
 		if (!ret)
 			cleanup_dev ();
@@ -871,19 +873,18 @@ int main (int argc, char *argv[])
 			goto exit;
 	}
 
-	pid = bootchart_find_running_pid (NULL);
+	collector_fd = collector_listen();
 	if (args.probe_running) {
-		clean_environment = pid < 0;
-		ret = pid < 0;
+		clean_environment = collector_fd < 0;
+		ret = collector_fd < 0;
 		goto exit;
-	} else {
-		if (pid >= 0) {
-			clean_environment = 0;
-			log ("bootchart collector already running as pid %d, exiting...\n", pid);
-			goto exit;
-		}
 	}
-      
+	if (collector_fd < 0) {
+		clean_environment = 0;
+		log ("bootchart daemon running already, exiting...\n");
+		goto exit;
+	}
+
 	/* defaults */
 	if (!args.hz)
 		args.hz = 50;
@@ -934,46 +935,69 @@ int main (int argc, char *argv[])
 			exit (1);
 	}
 
+	pollfds[0].fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	pollfds[0].events = POLLIN;
+	pollfds[0].revents = POLLIN;
+	timerfd_settime(pollfds[0].fd, 0, &(struct itimerspec) {
+			.it_interval.tv_nsec = 1000000000 / args.hz,
+			.it_value.tv_nsec    = 1000000000 / args.hz,
+		}, NULL);
+
+	pollfds[1].fd = collector_fd;
+	pollfds[1].events = POLLIN;
+	pollfds[1].revents = 0;
+
 	while (1) {
-		pid_t pid;
-		char uptime[80];
-		size_t uptimelen;
-		unsigned long u;
+		if (pollfds[0].revents) {
+			pid_t pid;
+			char uptime[80];
+			size_t uptimelen;
+			unsigned long u;
+			uint64_t cycles = 0;
 
-		if (in_initrd) {
-			if (have_dev_tmpfs ()) {
-				if (chroot_into_dev ()) {
-					log ("failed to chroot into /dev - exiting so run_init can proceed\n");
-					return 1;
-				}
-				in_initrd = 0;
+			read(pollfds[0].fd, &cycles, sizeof cycles);
+			if (cycles > 1) {
+				log("hz too high for cpu: %ld cycles elapsed\n", cycles);
 			}
+
+			if (in_initrd) {
+				if (have_dev_tmpfs ()) {
+					if (chroot_into_dev ()) {
+						log ("failed to chroot into /dev - exiting so run_init can proceed\n");
+						return 1;
+					}
+					in_initrd = 0;
+				}
+			}
+
+			u = get_uptime (uptime_fd);
+			if (!u)
+				return 1;
+
+			uptimelen = sprintf (uptime, "%lu\n", u - reltime);
+
+			buffer_file_dump_frame_with_timestamp (stat_file, stat_fd, uptime, uptimelen);
+			buffer_file_dump_frame_with_timestamp (disk_file, disk_fd, uptime, uptimelen);
+			buffer_file_dump_frame_with_timestamp (meminfo_file, meminfo_fd, uptime, uptimelen);
+
+			/* output data for each pid */
+			buffer_file_append (per_pid_file, uptime, uptimelen);
+
+			pid_scanner_restart (scanner);
+			while ((pid = pid_scanner_next (scanner))) {
+
+				if (use_taskstat)
+					dump_taskstat (per_pid_file, scanner);
+				else
+					dump_proc_stat (per_pid_file, pid);
+			}
+			buffer_file_append (per_pid_file, "\n", 1);
 		}
-      
-		u = get_uptime (uptime_fd);
-		if (!u)
-			return 1;
 
-		uptimelen = sprintf (uptime, "%lu\n", u - reltime);
+		if (pollfds[1].revents)
+			collector_handle(collector_fd, &map, &args);
 
-		buffer_file_dump_frame_with_timestamp (stat_file, stat_fd, uptime, uptimelen);
-		buffer_file_dump_frame_with_timestamp (disk_file, disk_fd, uptime, uptimelen);
-		buffer_file_dump_frame_with_timestamp (meminfo_file, meminfo_fd, uptime, uptimelen);
-
-		/* output data for each pid */
-		buffer_file_append (per_pid_file, uptime, uptimelen);
-
-		pid_scanner_restart (scanner);
-		while ((pid = pid_scanner_next (scanner))) {
-
-			if (use_taskstat)
-				dump_taskstat (per_pid_file, scanner);
-			else
-				dump_proc_stat (per_pid_file, pid);
-		}
-		buffer_file_append (per_pid_file, "\n", 1);
-
-		usleep (1000000 / args.hz);
+		poll(pollfds, sizeof(pollfds) / sizeof(pollfds[0]), -1);
 	}
 
 	/*

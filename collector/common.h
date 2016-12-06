@@ -67,42 +67,45 @@ void arguments_free         (Arguments *args);
 
 /* ---------------- output.c  ---------------- */
 
+typedef struct {
+	unsigned int   relative_time : 1;
+} DaemonFlags;
+
+
 /* Max ~ 128Mb of space for logging, should be enough */
 #define CHUNK_SIZE (128 * 1024)
-#define STACK_MAP_MAGIC "really-unique-stack-pointer-for-xp-detection-goodness"
 
 typedef struct {
 	char          dest_stream[60];
 	unsigned long length;
-	char          data[0];
+	char          data[CHUNK_SIZE - sizeof(char[60]) - sizeof(unsigned long)];
 } Chunk;
-#define CHUNK_PAYLOAD (CHUNK_SIZE - sizeof (Chunk))
 
 typedef struct {
-	char   magic[sizeof (STACK_MAP_MAGIC)];
 	Chunk *chunks[1024];
 	int    max_chunk;
-} StackMap;
-#define STACK_MAP_INIT { STACK_MAP_MAGIC, { 0, }, 0 }
+} BufferMap;
 
 typedef struct {
-	StackMap   *sm;
+	BufferMap  *bm;
 	const char *dest;
 	Chunk      *cur;
 } BufferFile;
 
-BufferFile *buffer_file_new            (StackMap *sm, const char *output_fname);
+BufferFile *buffer_file_new            (BufferMap *bm, const char *output_fname);
 void        buffer_file_dump           (BufferFile *file, int input_fd);
 void        buffer_file_append         (BufferFile *file, const char *str, size_t len);
 void        buffer_file_dump_frame_with_timestamp
                                        (BufferFile *file, int input_fd,
 					const char *uptime, size_t uptimelen);
 
-int         buffers_extract_and_dump   (const char *output_path,
-					Arguments  *remote_args);
 int         dump_dmsg                  (const char *output_path);
 int         dump_header                (const char *output_path);
-int         bootchart_find_running_pid (Arguments *opt_args);
+
+int         collector_listen           (void);
+int         collector_handle           (int listen_fd, BufferMap *bm, Arguments *args);
+int         collector_dump             (const char *output_path,
+					DaemonFlags *df);
 
 /* ---------------- tasks.c  ---------------- */
 
