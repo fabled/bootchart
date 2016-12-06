@@ -30,9 +30,6 @@
 static Chunk *chunk_alloc (BufferMap *bm, const char *dest)
 {
 	Chunk *c;
-	static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
-
-	pthread_mutex_lock (&guard);
 
 	/* if we run out of buffer, just keep writing to the last buffer */
 	if (bm->max_chunk == sizeof (bm->chunks)/sizeof(bm->chunks[0])) {
@@ -51,7 +48,6 @@ static Chunk *chunk_alloc (BufferMap *bm, const char *dest)
 		bm->chunks[bm->max_chunk++] = c;
 	}
 
-	pthread_mutex_unlock (&guard);
 	return c;
 }
 
@@ -202,7 +198,7 @@ collector_handle (int listen_fd, BufferMap *bm, Arguments *args)
 {
 	DaemonFlags df;
 	uint32_t cmd;
-	int fd;
+	int fd, ret = 0;
 
 	fd = accept(listen_fd, 0, 0);
 	if (fd < 0)
@@ -210,27 +206,25 @@ collector_handle (int listen_fd, BufferMap *bm, Arguments *args)
 
 	/* This blocks collector - but normally dump terminates the
 	 * collection anyway so it is ok */
-	while (1) {
-		if (read_all(fd, &cmd, sizeof cmd) < 0)
-			goto err;
+	if (read_all(fd, &cmd, sizeof cmd) < 0)
+		goto err;
 
-		log("Command %08x from client\n", cmd);
+	log("Command %08x from client\n", cmd);
 
-		switch (cmd) {
-		case CMD_DUMP_AND_EXIT:
-			df = (DaemonFlags) {
-				.relative_time = args->relative_time,
-			};
-			write_all(fd, &df, sizeof df);
-			collector_send_dump(fd, bm);
-			close(fd);
-			exit(0);
-		}
+	switch (cmd) {
+	case CMD_DUMP_AND_EXIT:
+		df = (DaemonFlags) {
+			.relative_time = args->relative_time,
+		};
+		write_all(fd, &df, sizeof df);
+		collector_send_dump(fd, bm);
+		ret = 1;
+		break;
 	}
 
 err:
 	close(fd);
-	return 0;
+	return ret;
 }
 
 int

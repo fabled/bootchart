@@ -66,9 +66,6 @@ typedef struct {
 typedef struct {
 	PidScanner     parent;
   
-	pthread_t      listener;
-	int	       socket;
-
 	/* used only by the calling thread */
 	Process      **procs;
 	int	       procs_size;
@@ -76,9 +73,6 @@ typedef struct {
 
 	unsigned int   cur_proc;
 	unsigned int   cur_thread;
-
-	/* guard for following members */
-	pthread_mutex_t lock;
 
 	/* queue up netlink events */
 	struct proc_event *buffer;
@@ -89,9 +83,8 @@ static int
 netlink_pid_scanner_free (PidScanner *scanner)
 {
 	NetLinkPidScanner *nls = (NetLinkPidScanner *) scanner;
-	if (nls->socket)
-		close (nls->socket);
-	pthread_mutex_destroy (&nls->lock);
+	if (nls->parent.fd)
+		close (nls->parent.fd);
 	return 0;
 }
 
@@ -202,13 +195,11 @@ netlink_pid_scanner_restart (PidScanner *scanner)
 	nls->cur_proc = 0;
 
 	/* Import anything new that arrived recently */
-	pthread_mutex_lock (&nls->lock);
 	evs = nls->buffer;
 	ev_count = nls->buffer_size;
 
 	nls->buffer = NULL;
 	nls->buffer_size = 0;
-	pthread_mutex_unlock (&nls->lock);
 
 	for (i = 0; i < ev_count; i++) {
 		struct proc_event *ev = evs + i;
@@ -340,11 +331,9 @@ handle_news (NetLinkPidScanner *nls, struct cn_msg *cn_hdr)
 						    ev->event_data.fork.parent_tgid);
 		/* drop through */
         case PROC_EVENT_EXIT:
-		pthread_mutex_lock (&nls->lock);
 		nls->buffer = realloc (nls->buffer, sizeof (struct proc_event) * (nls->buffer_size + 1));
 		memcpy (&(nls->buffer[nls->buffer_size]), ev, sizeof (struct proc_event));
 		nls->buffer_size++;
-		pthread_mutex_unlock (&nls->lock);
 		break;
 	/* postpone triggering callback until we have a new exec name and args */
         case PROC_EVENT_EXEC:
@@ -356,7 +345,7 @@ handle_news (NetLinkPidScanner *nls, struct cn_msg *cn_hdr)
         }
 }
 
-static size_t
+static ssize_t
 netlink_recvfrom (NetLinkPidScanner *nls, char *buffer)
 {
 	socklen_t from_nla_len;
@@ -368,47 +357,44 @@ netlink_recvfrom (NetLinkPidScanner *nls, char *buffer)
         from_nla.nl_pid = 1;
 
 	from_nla_len = sizeof(from_nla);
-	return recvfrom (nls->socket, buffer, BUFF_SIZE, 0,
+	return recvfrom (nls->parent.fd, buffer, BUFF_SIZE, 0,
 			 (struct sockaddr*)&from_nla, &from_nla_len);
 }
 
-static void *
-netlink_listen_thread (void *user_data)
+static void
+netlink_pid_scanner_poll (PidScanner *ps)
 {
-	NetLinkPidScanner *nls = user_data;
+	NetLinkPidScanner *nls = (NetLinkPidScanner *) ps;
   
 	struct cn_msg *cn_hdr;
 
 	char buff[BUFF_SIZE];
-	size_t recv_len = 0;
+	ssize_t recv_len = 0;
 
 	for (;;) {
-                struct nlmsghdr *nlh = (struct nlmsghdr*)buff;
+		struct nlmsghdr *nlh = (struct nlmsghdr*)buff;
 
-		/* block here mostly waiting for news ... */
 		ZERO_ARRAY (buff);
-                recv_len = netlink_recvfrom (nls, buff);
-                if (recv_len < 1)
-			continue;
+		recv_len = netlink_recvfrom (nls, buff);
+		if (recv_len < 1)
+			return;
 
 		/* parse the news */
-                while (NLMSG_OK (nlh, recv_len)) {
-                        cn_hdr = NLMSG_DATA (nlh);
-                        if (nlh->nlmsg_type == NLMSG_NOOP)
-                                continue;
-                        if ((nlh->nlmsg_type == NLMSG_ERROR) ||
-                            (nlh->nlmsg_type == NLMSG_OVERRUN)) {
+		while (NLMSG_OK (nlh, recv_len)) {
+			cn_hdr = NLMSG_DATA (nlh);
+			if (nlh->nlmsg_type == NLMSG_NOOP)
+				continue;
+			if ((nlh->nlmsg_type == NLMSG_ERROR) ||
+			    (nlh->nlmsg_type == NLMSG_OVERRUN)) {
 				log ("Netlink error or overrun !\n");
-                                break;
+				break;
 			}
 			handle_news (nls, cn_hdr);
-                        if (nlh->nlmsg_type == NLMSG_DONE)
-                                break;
-                        nlh = NLMSG_NEXT(nlh, recv_len);
-                }
-        }
-
-        return NULL;
+			if (nlh->nlmsg_type == NLMSG_DONE)
+				break;
+			nlh = NLMSG_NEXT(nlh, recv_len);
+		}
+	}
 }
 
 PidScanner *
@@ -434,6 +420,7 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
 	INIT(get_tasks_start);
 	INIT(get_tasks_next);
 	INIT(get_tasks_stop);
+	INIT(poll);
 #undef INIT
 
         /*
@@ -442,8 +429,8 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
          * service (SOCK_DGRAM). The protocol used is the connector
          * protocol (NETLINK_CONNECTOR)
          */
-        nls->socket = socket (PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
-        if (nls->socket == -1) {
+        nls->parent.fd = socket (PF_NETLINK, SOCK_NONBLOCK|SOCK_CLOEXEC|SOCK_DGRAM, NETLINK_CONNECTOR);
+        if (nls->parent.fd == -1) {
                 log ("netlink socket error\n");
                 free (nls);
                 return NULL;
@@ -452,7 +439,7 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
         my_nla.nl_groups = CN_IDX_PROC;
         my_nla.nl_pid = getpid();
 
-        if (bind (nls->socket, (struct sockaddr *)&my_nla, sizeof(my_nla))) {
+        if (bind (nls->parent.fd, (struct sockaddr *)&my_nla, sizeof(my_nla))) {
 		log ("binding nls->socket error\n");
                 goto close_and_exit;
         }
@@ -471,7 +458,7 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
         cn_hdr->id.idx = CN_IDX_PROC;
         cn_hdr->id.val = CN_VAL_PROC;
         cn_hdr->len = sizeof(enum proc_cn_mcast_op);
-        if (send (nls->socket, nl_hdr, nl_hdr->nlmsg_len, 0) != nl_hdr->nlmsg_len) {
+        if (send (nls->parent.fd, nl_hdr, nl_hdr->nlmsg_len, 0) != nl_hdr->nlmsg_len) {
 		log("failed to send proc connector mcast ctl op!\n");
                 goto close_and_exit;
         } else {
@@ -479,7 +466,7 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
                 struct nlmsghdr *nlh = (struct nlmsghdr*)buff;
 		struct pollfd pr = { 0, };
 
-		pr.fd = nls->socket;
+		pr.fd = nls->parent.fd;
 		pr.events = POLLIN;
 		if ((poll (&pr, 1, 50 /* ms */) <= 0) || (!(pr.revents & POLLIN))) {
 			log ("No PROC_EVENTs present\n");
@@ -507,13 +494,6 @@ pid_scanner_new_netlink (PidScanEventFn event_fn, void *user_data)
 			}
 			/* we made it ... */
 		}
-	}
-
-	pthread_mutex_init (&nls->lock, NULL);
-
-	if (pthread_create (&nls->listener, NULL, netlink_listen_thread, nls)) {
-	    log ("Failed to create netlink thread\n");
-	    goto close_and_exit;
 	}
 
 	netlink_pid_scanner_bootstrap (nls);

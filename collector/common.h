@@ -137,6 +137,7 @@ struct _PidScanner {
 	PidMap          map;
 	PidScanEventFn  event_fn;
 	void           *user_data;
+	int             fd;
 
 	int    (*free)         (PidScanner *scanner);  
 	void   (*restart)      (PidScanner *scanner);  
@@ -147,6 +148,7 @@ struct _PidScanner {
 	void   (*get_tasks_start) (PidScanner *scanner);
 	pid_t  (*get_tasks_next)  (PidScanner *scanner);
 	void   (*get_tasks_stop)  (PidScanner *scanner);
+	void   (*poll)            (PidScanner *scanner);
 };
 
 PidScanner *pid_scanner_new_netlink     (PidScanEventFn event_cb,
@@ -164,6 +166,7 @@ PidScanner *pid_scanner_new_proc	(const char *proc_path,
 #define	    pid_scanner_get_tasks_start(s)  (s)->get_tasks_start(s)
 #define	    pid_scanner_get_tasks_next(s)   (s)->get_tasks_next(s)
 #define	    pid_scanner_get_tasks_stop(s)   (s)->get_tasks_stop(s)
+#define	    pid_scanner_poll(s)         (s)->poll(s)
 
 /* for impl. only */
 PidScanner *pid_scanner_alloc           (int            derived_size,

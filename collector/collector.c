@@ -833,7 +833,8 @@ int main (int argc, char *argv[])
 	int *fds[] = { &stat_fd, &disk_fd, &uptime_fd, &meminfo_fd, NULL };
 	const char *fd_names[] = { "/stat", "/diskstats", "/uptime", "/meminfo", NULL };
 	BufferMap map = {0};
-	struct pollfd pollfds[2];
+	struct pollfd pollfds[3];
+	int npollfds = 0;
 
 	arguments_set_defaults (&args);
 	arguments_parse (&args, argc, argv);
@@ -946,6 +947,14 @@ int main (int argc, char *argv[])
 	pollfds[1].fd = collector_fd;
 	pollfds[1].events = POLLIN;
 	pollfds[1].revents = 0;
+	npollfds = 2;
+
+	if (scanner->fd) {
+		pollfds[2].fd = scanner->fd;
+		pollfds[2].events = POLLIN;
+		pollfds[2].revents = 0;
+		npollfds++;
+	}
 
 	while (1) {
 		if (pollfds[0].revents) {
@@ -996,6 +1005,9 @@ int main (int argc, char *argv[])
 
 		if (pollfds[1].revents)
 			collector_handle(collector_fd, &map, &args);
+
+		if (pollfds[2].revents)
+			pid_scanner_poll (scanner);
 
 		poll(pollfds, sizeof(pollfds) / sizeof(pollfds[0]), -1);
 	}
